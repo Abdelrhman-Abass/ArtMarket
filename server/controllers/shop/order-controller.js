@@ -1,5 +1,8 @@
-import paypal from "../../helpers/paypal.js";
+import paypal from '../../helpers/paypal.js';
 import { PrismaClient } from '@prisma/client';
+import Stripe from 'stripe';
+
+const stripe = new Stripe(process.env.STRIPE_SECRET);
 
 const prisma = new PrismaClient();
 
@@ -21,76 +24,122 @@ export const createOrder = async (req, res) => {
       cartId,
     } = req.body;
 
-    const create_payment_json = {
-      intent: "sale",
-      payer: {
-        payment_method: "paypal",
-      },
-      redirect_urls: {
-        return_url: "http://localhost:5173/shop/paypal-return",
-        cancel_url: "http://localhost:5173/shop/paypal-cancel",
-      },
-      transactions: [
-        {
-          item_list: {
-            items: cartItems.map((item) => ({
-              name: item.title,
-              sku: item.productId,
-              price: item.price.toFixed(2),
-              currency: "USD",
-              quantity: item.quantity,
-            })),
-          },
-          amount: {
-            currency: "USD",
-            total: totalAmount.toFixed(2),
-          },
-          description: "description",
+    if (paymentMethod === 'paypal') {
+      const create_payment_json = {
+        intent: 'sale',
+        payer: {
+          payment_method: 'paypal',
         },
-      ],
-    };
-
-    paypal.payment.create(create_payment_json, async (error, paymentInfo) => {
-      if (error) {
-        console.log(error);
-        return res.status(500).json({
-          success: false,
-          message: "Error while creating PayPal payment",
-        });
-      } else {
-        const newlyCreatedOrder = await prisma.order.create({
-          data: {
-            userId: parseInt(userId),
-            cartId,
-            cartItems,
-            addressInfo,
-            orderStatus,
-            paymentMethod,
-            paymentStatus,
-            totalAmount,
-            orderDate,
-            orderUpdateDate,
-            paymentId,
-            payerId,
+        redirect_urls: {
+          return_url: 'http://localhost:5173/shop/paypal-return',
+          cancel_url: 'http://localhost:5173/shop/paypal-cancel',
+        },
+        transactions: [
+          {
+            item_list: {
+              items: cartItems.map((item) => ({
+                name: item.title,
+                sku: item.productId,
+                price: item.price.toFixed(2),
+                currency: 'USD',
+                quantity: item.quantity,
+              })),
+            },
+            amount: {
+              currency: 'USD',
+              total: totalAmount.toFixed(2),
+            },
+            description: 'description',
           },
-        });
+        ],
+      };
 
-        const approvalURL = paymentInfo.links.find(
-          (link) => link.rel === "approval_url"
-        ).href;
+      paypal.payment.create(create_payment_json, async (error, paymentInfo) => {
+        if (error) {
+          console.log(error);
+          return res.status(500).json({
+            success: false,
+            message: 'Error while creating PayPal payment',
+          });
+        } else {
+          const newlyCreatedOrder = await prisma.order.create({
+            data: {
+              userId: parseInt(userId),
+              cartId,
+              cartItems,
+              addressInfo,
+              orderStatus,
+              paymentMethod,
+              paymentStatus,
+              totalAmount,
+              orderDate,
+              orderUpdateDate,
+              paymentId,
+              payerId,
+            },
+          });
 
-        res.status(201).json({
-          success: true,
-          approvalURL,
-          orderId: newlyCreatedOrder.id,
-        });
-      }
-    });
+          const approvalURL = paymentInfo.links.find(
+            (link) => link.rel === 'approval_url'
+          ).href;
+
+          res.status(201).json({
+            success: true,
+            approvalURL,
+            orderId: newlyCreatedOrder.id,
+          });
+        }
+      });
+    } else if (paymentMethod === 'stripe') {
+      const session = await stripe.checkout.sessions.create({
+        payment_method_types: ['card'],
+        line_items: cartItems.map((item) => ({
+          price_data: {
+            currency: 'usd',
+            product_data: {
+              name: item.title,
+            },
+            unit_amount: Math.round(item.price * 100),
+          },
+          quantity: item.quantity,
+        })),
+        mode: 'payment',
+        success_url: 'http://localhost:5173/shop/stripe-success',
+        cancel_url: 'http://localhost:5173/shop/stripe-cancel',
+      });
+
+      const newlyCreatedOrder = await prisma.order.create({
+        data: {
+          userId: parseInt(userId),
+          cartId,
+          cartItems,
+          addressInfo,
+          orderStatus,
+          paymentMethod,
+          paymentStatus,
+          totalAmount,
+          orderDate,
+          orderUpdateDate,
+          paymentId: session.id,
+        },
+      });
+
+      res.status(201).json({
+        success: true,
+        sessionId: session.id,
+        orderId: newlyCreatedOrder.id,
+      });
+    } else {
+      res.status(400).json({
+        success: false,
+        message: 'Invalid payment method',
+      });
+    }
   } catch (e) {
     console.log(e);
     res.status(500).json({
       success: false,
-      message: "Some error occurred!",
+      message: 'Some error occurred!',
     });
   }
 };
@@ -98,7 +147,7 @@ export const createOrder = async (req, res) => {
 // Capture Payment
 export const capturePayment = async (req, res) => {
   try {
-    const { paymentId, payerId, orderId } = req.body;
+    const { paymentId, payerId, orderId, paymentMethod } = req.body;
 
     let order = await prisma.order.findUnique({
       where: { id: parseInt(orderId) },
@@ -108,19 +157,43 @@ export const capturePayment = async (req, res) => {
     if (!order) {
       return res.status(404).json({
         success: false,
-        message: "Order cannot be found",
+        message: 'Order cannot be found',
       });
     }
 
-    order = await prisma.order.update({
-      where: { id: parseInt(order.id) },
-      data: {
-        paymentStatus: "paid",
-        orderStatus: "confirmed",
-        paymentId,
-        payerId,
-      },
-    });
+    if (paymentMethod === 'paypal') {
+      order = await prisma.order.update({
+        where: { id: parseInt(order.id) },
+        data: {
+          paymentStatus: 'paid',
+          orderStatus: 'confirmed',
+          paymentId,
+          payerId,
+        },
+      });
+    } else if (paymentMethod === 'stripe') {
+      const session = await stripe.checkout.sessions.retrieve(paymentId);
+      if (session.payment_status === 'paid') {
+        order = await prisma.order.update({
+          where: { id: parseInt(order.id) },
+          data: {
+            paymentStatus: 'paid',
+            orderStatus: 'confirmed',
+            paymentId,
+          },
+        });
+      } else {
+        return res.status(400).json({
+          success: false,
+          message: 'Payment not completed',
+        });
+      }
+    } else {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid payment method',
+      });
+    }
 
     // Update product stock
     for (let item of order.cartItems) {
@@ -131,7 +204,9 @@ export const capturePayment = async (req, res) => {
       if (!product || product.totalStock < item.quantity) {
         return res.status(404).json({
           success: false,
-          message: `Not enough stock for this product ${product ? product.title : 'N/A'}`,
+          message: `Not enough stock for this product ${
+            product ? product.title : 'N/A'
+          }`,
         });
       }
 
@@ -149,14 +224,14 @@ export const capturePayment = async (req, res) => {
 
     res.status(200).json({
       success: true,
-      message: "Order confirmed",
+      message: 'Order confirmed',
       data: order,
     });
   } catch (e) {
     console.log(e);
     res.status(500).json({
       success: false,
-      message: "Some error occurred!",
+      message: 'Some error occurred!',
     });
   }
 };
@@ -173,7 +248,7 @@ export const getAllOrdersByUser = async (req, res) => {
     if (!orders.length) {
       return res.status(404).json({
         success: false,
-        message: "No orders found!",
+        message: 'No orders found!',
       });
     }
 
@@ -185,7 +260,7 @@ export const getAllOrdersByUser = async (req, res) => {
     console.log(e);
     res.status(500).json({
       success: false,
-      message: "Some error occurred!",
+      message: 'Some error occurred!',
     });
   }
 };
@@ -202,7 +277,7 @@ export const getOrderDetails = async (req, res) => {
     if (!order) {
       return res.status(404).json({
         success: false,
-        message: "Order not found!",
+        message: 'Order not found!',
       });
     }
 
@@ -214,7 +289,7 @@ export const getOrderDetails = async (req, res) => {
     console.log(e);
     res.status(500).json({
       success: false,
-      message: "Some error occurred!",
+      message: 'Some error occurred!',
     });
   }
 };
